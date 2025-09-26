@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>本格カラオケ採点デモ</title>
+<style>
+  body{margin:0;font-family:system-ui;background:#071029;color:#E6EEF8;padding:20px;}
+  .wrap{max-width:900px;margin:0 auto;}
+  .card{background:rgba(255,255,255,0.05);padding:16px;border-radius:12px;margin-bottom:16px;}
+  #lyrics{font-size:22px;min-height:60px;display:flex;flex-direction:column;align-items:center;}
+  .line{opacity:.5;transition:all .2s;}
+  .line.current{opacity:1;color:#EF4444;font-weight:700;}
+  #score{font-size:20px;color:#FFD166;font-weight:700;}
+  #pitchGraph{width:100%;height:120px;background:#0B2236;border-radius:8px;position:relative;overflow:hidden;margin-top:10px;}
+  .graph-line{position:absolute;height:2px;background:#EF4444;bottom:0;}
+  button{padding:8px 12px;margin-right:8px;border:none;border-radius:8px;background:#EF4444;color:white;cursor:pointer;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>本格カラオケ採点デモ</h1>
+    <audio id="player" controls src="sound/夏の影/夏の影.mp3"></audio>
+    <input type="file" id="lrcFile" accept=".lrc">
+    <div id="lyrics"><div class="line">歌詞を読み込んでください</div></div>
+  </div>
+
+  <div class="card">
+    <button id="startRec">録音開始</button>
+    <button id="stopRec" disabled>録音停止</button>
+    <button id="downloadRec" disabled>録音ダウンロード</button>
+    <div>現在ピッチ: <span id="pitch">— Hz</span></div>
+    <div>判定: <span id="note">—</span></div>
+    <div>合計スコア: <span id="score">0</span></div>
+    <div id="pitchGraph"></div>
+  </div>
+</div>
+
+<script>
+/* ================= LRC読み込み ================= */
+let lrcLines = [];
+const lyricsDiv = document.getElementById('lyrics');
+document.getElementById('lrcFile').addEventListener('change', async e=>{
+  const f = e.target.files[0];
+  if(!f) return;
+  const txt = await f.text();
+  lrcLines = parseLRC(txt);
+  renderInitialLyrics();
+});
+function parseLRC(text){
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  for(const line of lines){
+    if(line.match(/^\[(ar|ti|al|by):/i)) continue;
+    const times = [...line.matchAll(/\[(\d+:\d+(?:\.\d+)?)\]/g)];
+    const content = line.replace(/\[(\d+:\d+(?:\.\d+)?)\]/g,"").trim();
+    for(const t of times){ out.push({time: timestampToSeconds(t[1]), text: content}); }
+  }
+  out.sort((a,b)=>a.time-b.time);
+  return out;
+}
+function timestampToSeconds(ts){ const m=ts.match(/(\d+):(\d+(?:\.\d+)?)/); return parseInt(m[1])*60+parseFloat(m[2]); }
+function renderInitialLyrics(){
+  if(lrcLines.length===0){ lyricsDiv.innerHTML='<div class="line">読み込めませんでした</div>'; return; }
+  let html='';
+  for(let i=0;i<Math.min(5,lrcLines.length);i++) html+=`<div class="line">${lrcLines[i].text}</div>`;
+  lyricsDiv.innerHTML=html;
+}
+function showLyricsAt(time){
+  if(lrcLines.length===0) return;
+  let idx=-1;
+  for(let i=0;i<lrcLines.length;i++){ if(time>=lrcLines[i].time) idx=i; else break; }
+  const start=Math.max(0,idx-2), end=Math.min(lrcLines.length-1, idx+2);
+  let html='';
+  for(let i=start;i<=end;i++){
+    html+=`<div class="line ${i===idx?'current':''}">${lrcLines[i].text}</div>`;
+  }
+  lyricsDiv.innerHTML=html;
+}
+
+/* ================= 高精度参照メロディ ================= */
+// 外部JSONから参照周波数をロードして利用する想定
+let referenceData = []; // [{time:0.1,freq:261.63}, ...]
+async function loadReferenceJSON(url){ 
+  const res=await fetch(url); 
+  referenceData=await res.json(); 
+}
+function getReferenceFreqAt(t){
+  if(referenceData.length===0) return null;
+  let last=null;
+  for(const p of referenceData){ if(p.time<=t) last=p; else break; }
+  return last?last.freq:null;
+}
+
+/* ================= 録音 ================= */
+let mediaRecorder, recordedChunks=[];
+const startRecBtn=document.getElementById('startRec');
+const stopRecBtn=document.getElementById('stopRec');
+const downloadRecBtn=document.getElementById('downloadRec');
+
+startRecBtn.addEventListener('click', async ()=>{
+  const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+  recordedChunks=[]; 
+  mediaRecorder=new MediaRecorder(stream,{mimeType:'audio/webm;codecs=opus'});
+  mediaRecorder.ondataavailable=e=>{if(e.data.size>0) recordedChunks.push(e.data);};
+  mediaRecorder.onstop=()=>{ downloadRecBtn.disabled=false; };
+  mediaRecorder.start();
+  startRecBtn.disabled=true; stopRecBtn.disabled=false;
+  await setupPitchDetector(stream);
+});
+stopRecBtn.addEventListener('click', ()=>{ if(mediaRecorder) mediaRecorder.stop(); startRecBtn.disabled=false; stopRecBtn.disabled=true; });
+downloadRecBtn.addEventListener('click', ()=>{
+  const blob=new Blob(recordedChunks,{type:'audio/webm'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download='karaoke_recording.webm'; a.click();
+  URL.revokeObjectURL(url);
+});
+
+/* ================= ピッチ検出 (YIN簡易版) ================= */
+let audioCtx, analyser, srcNode, rafId;
+const pitchElem=document.getElementById('pitch');
+const noteElem=document.getElementById('note');
+const scoreElem=document.getElementById('score');
+let totalScore=0, measureCount=0;
+const pitchGraph=document.getElementById('pitchGraph');
+
+async function setupPitchDetector(stream){
+  if(audioCtx) return;
+  audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+  srcNode=audioCtx.createMediaStreamSource(stream);
+  analyser=audioCtx.createAnalyser();
+  analyser.fftSize=2048;
+  srcNode.connect(analyser);
+  detectPitchLoop();
+}
+
+function detectPitchLoop(){
+  const bufferLen=analyser.fftSize;
+  const buf=new Float32Array(bufferLen);
+  analyser.getFloatTimeDomainData(buf);
+  const pitch=simpleYIN(buf,audioCtx.sampleRate);
+  if(pitch>50 && pitch<2000){
+    pitchElem.textContent=pitch.toFixed(1)+' Hz';
+    const t=document.getElementById('player').currentTime;
+    const refFreq=getReferenceFreqAt(t);
+    if(refFreq){
+      const cents=Math.abs(1200*Math.log2(pitch/refFreq));
+      noteElem.textContent=cents<50?'良':'要改善';
+      const pts=cents<30?100:cents<70?70:cents<150?40:0;
+      totalScore+=pts; measureCount++;
+      scoreElem.textContent=Math.round(totalScore/Math.max(1,measureCount));
+      plotPitchGraph(pitch, refFreq);
+    }
+  }else{ pitchElem.textContent='— Hz'; noteElem.textContent='—'; }
+  rafId=requestAnimationFrame(detectPitchLoop);
+}
+
+function simpleYIN(buf,sr){ /* 超簡易版YIN */ 
+  let minR=Infinity, bestOffset=0;
+  for(let offset=32;offset<1024;offset++){
+    let sum=0;
+    for(let i=0;i<buf.length-offset;i++) sum+=Math.pow(buf[i]-buf[i+offset],2);
+    if(sum<minR){ minR=sum; bestOffset=offset; }
+  }
+  return sr/bestOffset;
+}
+
+function plotPitchGraph(p,f){
+  const y=Math.min(1,f?Math.abs(p-f)/100:0)*100;
+  const line=document.createElement('div');
+  line.className='graph-line'; line.style.width='2px'; line.style.left=pitchGraph.children.length+'px';
+  line.style.height=y+'%'; pitchGraph.appendChild(line);
+  if(pitchGraph.children.length>pitchGraph.clientWidth) pitchGraph.removeChild(pitchGraph.firstChild);
+}
+
+/* ================= 再生同期 ================= */
+const player=document.getElementById('player');
+player.addEventListener('timeupdate', ()=>{ showLyricsAt(player.currentTime); });
+
+</script>
+</body>
+</html>
